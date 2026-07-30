@@ -25,6 +25,7 @@ import type { PoolManager } from '../pool/pool-manager.js';
 import type { AuditLogger } from '../audit/audit-logger.js';
 import type { QueryResponse } from './query.schema.js';
 import { assertSingleStatement } from './single-statement.js';
+import { assertStatementAllowed } from './statement-guard.js';
 import { BadRequestError, ServiceUnavailableError } from './gateway-errors.js';
 
 /** idle_in_transaction_session_timeout is kept above statement_timeout so a
@@ -70,22 +71,40 @@ export class QueryService {
     ) {}
 
     async run(input: RunInput): Promise<RunResult> {
-        // Guardrail: reject multi-statement SQL before any DB contact (→ 400).
+        const started = Date.now();
+
+        // Guardrail (always-on, first): reject multi-statement SQL before any DB
+        // contact (→ 400). The escape hatch below never relaxes this. Audited too —
+        // a `;`-smuggle is a primary attack and must show up in the security stream.
         try {
             assertSingleStatement(input.sql);
         } catch (err) {
-            throw new BadRequestError((err as Error).message);
+            const msg = (err as Error).message;
+            this.auditError(input, started, msg);
+            throw new BadRequestError(msg);
         }
 
         const dsCfg = this.pools.getConfig(input.datasource);
+
+        // Defense-in-depth: reject side-effecting statements/functions (COPY,
+        // pg_read_file, …) that a read-only txn does NOT stop, before any DB contact.
+        // Skipped only when the operator has explicitly opted this datasource out.
+        // Blocked attempts are audited so they show up in the security stream.
+        if (!dsCfg.allowUnsafeStatements) {
+            try {
+                assertStatementAllowed(input.sql, { write: input.write });
+            } catch (err) {
+                this.auditError(input, started, (err as Error).message);
+                throw err;
+            }
+        }
+
         // Clamps: a request may only LOWER the timeout / row cap, never exceed the
         // per-datasource statement timeout or the absolute row ceiling.
         const stmtMs = clamp(input.timeoutMs ?? dsCfg.statementTimeoutMs, 1, dsCfg.statementTimeoutMs);
         const idleMs = stmtMs + IDLE_TXN_BUFFER_MS;
         const maxRows = clamp(input.maxRows ?? this.maxRowsCeiling, 1, this.maxRowsCeiling);
         const schemaIdent = quoteIdent(input.schema);
-
-        const started = Date.now();
 
         // Acquire — bounded by connectionTimeoutMillis; failure to acquire (DB down
         // or pool saturated) surfaces as 503, not an unbounded wait.

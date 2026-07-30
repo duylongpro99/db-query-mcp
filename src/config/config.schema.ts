@@ -25,6 +25,12 @@ export const datasourceSchema = z.object({
     idleTimeoutMs: z.coerce.number().int().nonnegative().default(10000),
     connectionTimeoutMs: z.coerce.number().int().nonnegative().default(5000),
     maxUses: z.coerce.number().int().nonnegative().default(7500),
+    // Escape hatch: when true, the per-statement guard (statement-guard.ts) is
+    // skipped for this datasource — dangerous/admin statements (COPY, pg_read_file,
+    // …) are permitted. Default false = guard enforced. The multi-statement scan
+    // and the read-only transaction stay on regardless. Enabling it re-exposes the
+    // RCE/file-access class IFF the DB role is privileged, so boot logs a WARN.
+    allowUnsafeStatements: z.boolean().default(false),
 });
 
 export const tokenSchema = z.object({

@@ -43,6 +43,12 @@ function dsConfig(poolMax: number): DatasourceConfig {
         idleTimeoutMs: 10000,
         connectionTimeoutMs: 5000,
         maxUses: 7500,
+        // These tests prove ENGINE-level guarantees — the read-only txn rejecting a
+        // write, DISCARD ALL scrubbing a plain SET, statement_timeout firing — which
+        // requires those statements to REACH the engine. The app-layer statement
+        // guard would otherwise 400 them first, so it is deliberately disabled here.
+        // (The guard has its own coverage in query-service/statement-guard tests.)
+        allowUnsafeStatements: true,
     };
 }
 

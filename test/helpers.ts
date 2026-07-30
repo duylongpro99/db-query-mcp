@@ -32,6 +32,7 @@ export function makeConfig(overrides: Partial<RootConfig> = {}): RootConfig {
                 idleTimeoutMs: 10000,
                 connectionTimeoutMs: 5000,
                 maxUses: 7500,
+                allowUnsafeStatements: false,
             },
         ],
         tokens: [

@@ -48,6 +48,7 @@ function buildDatasource(name: string): Record<string, unknown> {
         idleTimeoutMs: env(`${p}IDLE_TIMEOUT_MS`),
         connectionTimeoutMs: env(`${p}CONNECTION_TIMEOUT_MS`),
         maxUses: env(`${p}MAX_USES`),
+        allowUnsafeStatements: bool(env(`${p}ALLOW_UNSAFE_STATEMENTS`)),
     };
 }
 
@@ -62,6 +63,7 @@ function fallbackDatasource(): Record<string, unknown> {
         database: env('DATABASE_NAME'),
         ssl: bool(env('DATABASE_SSL')),
         defaultSchema: env('DATABASE_DEFAULT_SCHEMA'),
+        allowUnsafeStatements: bool(env('DATABASE_ALLOW_UNSAFE_STATEMENTS')),
     };
 }
 
