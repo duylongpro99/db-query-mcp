@@ -30,8 +30,11 @@ pool and exposes a guarded QUERY capability instead of a connection.
 - **One statement per request, enforced by the wire protocol.** All SQL runs through the
   extended protocol (`queryMode:'extended'`), under which *the server* rejects
   multi-statement text. This is structural; the text scanner is only a fast 400.
-- **Read-only by default**, enforced at the engine (`BEGIN TRANSACTION READ ONLY`) — no
-  fragile SQL keyword blocklist. Writes are opt-in (see below).
+- **Read-only by default**, enforced at the engine (`BEGIN TRANSACTION READ ONLY`) with a
+  DB-role backstop; an app-layer **statement guard** (leading-keyword allowlist + banned
+  side-effecting-function scan) adds defense-in-depth for what a read-only txn does *not*
+  stop (`COPY`, `pg_read_file`, …) — belt to the braces, never the sole barrier. Writes
+  are opt-in (see below).
 - **Layered timeouts**: `connectionTimeoutMillis` (acquire), `statement_timeout` (query),
   `idle_in_transaction_session_timeout` (stalled txn).
 - `acquire → use → release-in-finally`; a mandatory `pool.on('error')` handler on every
@@ -96,12 +99,40 @@ queries add `write:true`, `command`, and `rowsAffected` to the audit line.
 Exposes `run_query`, `list_schemas`, `list_tables`, `describe_table` over MCP — thin
 wrappers over the SAME services, so all guardrails/auth/audit apply identically.
 
+The server also advertises usage **`instructions`** (built from the live identity — the
+datasource list and read/write posture are accurate, not aspirational). MCP clients like
+Claude Code surface these in the agent's system prompt, so **any project that registers
+the server gets the usage guidance automatically** ("prefer over ad-hoc psql", the
+datasource name, the params-not-literals rule) — no per-project CLAUDE.md rule to write
+or keep in sync. That said, the guidance appears only in clients that surface MCP server
+instructions; if you want the preference committed in-repo for teammates or non-surfacing
+clients, add a short project rule too.
+
 - Identity is process-level: set `MCP_TOKEN=<a configured secret>`; the process runs with
   that token's capabilities.
 - `npm run start:mcp` — stdio (default; for a local agent client).
 - `npm run start:mcp:http` — streamable HTTP (`MCP_TRANSPORT=http`), binds loopback by
   default (`MCP_HTTP_HOST`/`MCP_HTTP_PORT`). Never expose publicly — trusted infra utility.
 - `npm run inspect` — MCP inspector against the built server.
+
+### Quick install into any project
+
+`install-mcp.sh` registers this gateway as a Claude Code MCP server pointing at
+**this** shared install (its single `.env` = one home for DB creds + `MCP_TOKEN`). It
+never copies the server, so credentials never fork. It builds the gateway if needed,
+refuses to register against a missing/placeholder `.env`, and is idempotent.
+
+```
+./install-mcp.sh              # user scope → available in EVERY project, nothing else to do
+./install-mcp.sh --project    # write ./.mcp.json here (committable — teammates inherit it)
+./install-mcp.sh --project DIR # write DIR/.mcp.json
+./install-mcp.sh --local      # this project only, private
+./install-mcp.sh --link       # symlink onto PATH as `pgcp-mcp-install` for future one-liners
+./install-mcp.sh --print      # just print the JSON block
+```
+
+Then run `/mcp` in the Claude Code session to connect. Because it emits an **absolute**
+path, the entry works from any project regardless of where it lives.
 
 ## Scripts
 
@@ -239,6 +270,51 @@ One caveat the probe cannot cover: if `dblink` or `postgres_fdw` is installed, `
 defaults to `PUBLIC` and `dblink('…','INSERT …')` writes over a *separate* connection —
 outside the read-only transaction and outside any grant the role holds. Revoke `EXECUTE`
 on those functions, or don't install them on a database this gateway reaches.
+
+Runbook for creating the role: [`docs/runbooks/agent-ro-pg-role.md`](docs/runbooks/agent-ro-pg-role.md).
+
+### Statement guard (defense-in-depth)
+
+A Postgres `READ ONLY` transaction blocks DB *data/catalog* writes but **not** `COPY … TO
+PROGRAM/'file'`, `pg_read_file`/`pg_ls_dir`, backend signals (`pg_terminate_backend`), or
+WAL messages (`pg_logical_emit_message`) — all catastrophic under a superuser role (see
+[the risk report](docs/risks/2026-07-29-mcp-run_query-write-and-rce-bypass.md)). Every call
+therefore passes an app-layer guard at the single `QueryService.run()` choke point (so
+HTTP `/query`, MCP `run_query`, and introspection are all covered), **before any DB
+contact**:
+
+- **Leading-keyword allowlist.** Read mode permits `SELECT`, `WITH`, `EXPLAIN`, `SHOW`,
+  `VALUES`, `TABLE`; write mode adds `INSERT`, `UPDATE`, `DELETE`, `MERGE`. Anything else
+  (`COPY`, `CALL`, `DO`, `SET`, `ALTER`, `CREATE`, …) is rejected — an allowlist needs no
+  per-keyword maintenance.
+- **Banned-function scan.** Side-effecting/host-access functions (`pg_read_file`,
+  `pg_ls_*`, `lo_export`, `dblink*`, `pg_reload_conf`, `pg_terminate_backend`,
+  `pg_logical_emit_message`, `pg_stat_reset*`, …) are rejected in **both** modes, even
+  inside an allowed statement (`SELECT pg_read_file(…)`).
+
+Both run over the shared `stripToCode` view ([`sql-lexer.ts`](src/query/sql-lexer.ts)) that
+blanks comments/strings/dollar-bodies, so the checks can't be comment- or string-bypassed
+(`SELECT 'pg_read_file(' AS note` is allowed; `SELECT/**/pg_read_file(…)` is not). The
+function scan reads an ident-revealing variant so a **quoted** call `SELECT
+"pg_read_file"(…)` — which Postgres resolves to the same function — is caught too. A
+rejection is a `400` and is **audited** (blocked attempts, including `;`-smuggle, show up
+in the security stream). The multi-statement scan and the read-only transaction are
+separate and always-on.
+
+The one residual evasion a text scanner can't close is a `U&"\0070g_read_file"`
+unicode-escape identifier — which is exactly why this is defense-in-depth and the
+non-superuser DB role (above) is the durable fix, not this guard.
+
+This is **defense-in-depth, not the guarantee** — it ships *with* the non-superuser DB
+role above, never instead of it (denylists drift; the role holds no privilege to begin
+with).
+
+**Escape hatch.** A datasource whose DB role is trusted and which legitimately needs
+admin/`COPY`/file statements can opt out with `DS_<NAME>_ALLOW_UNSAFE_STATEMENTS=true`
+(default **false**, fail-closed — any non-`true` value keeps the guard on). It relaxes
+**only** this statement guard; the multi-statement scan and the read-only transaction stay
+enforced. Enabling it removes a security layer, so **every boot logs a WARN** naming the
+datasource.
 
 ### Network binding
 

@@ -153,6 +153,18 @@ export async function assertReadOnlyPosture(services: Services, identity?: strin
     const log = services.logger;
 
     for (const datasource of services.pools.names()) {
+        // Loud when the statement guard has been switched off: this re-exposes the
+        // COPY/file/signal class IFF the DB role is privileged, so it cross-references
+        // the posture verdict below rather than standing alone.
+        if (services.pools.getConfig(datasource).allowUnsafeStatements) {
+            log.warn(
+                { datasource, allowUnsafeStatements: true },
+                `statement guard DISABLED for datasource "${datasource}" (ALLOW_UNSAFE_STATEMENTS=true) — ` +
+                    'dangerous statements (COPY, pg_read_file, backend signals, …) are permitted; ' +
+                    'ensure this datasource points at a trusted DB role',
+            );
+        }
+
         const writeTokens = writeTokensFor(services.config.tokens, datasource);
 
         let posture: Posture;

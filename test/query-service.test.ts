@@ -7,10 +7,26 @@ import { makeConfig, silentLogger, StubDriver, CapturingAudit } from './helpers.
 
 const config = makeConfig();
 const pools = new PoolManager(config.datasources, silentLogger);
-after(() => pools.drainAll());
+
+// A second pool whose only datasource has the statement-guard escape hatch ON.
+// Same logical name ('main') so `base.datasource` works unchanged; getConfig now
+// returns allowUnsafeStatements:true, so the guard is skipped.
+const unsafeConfig = makeConfig({
+    datasources: [{ ...config.datasources[0], allowUnsafeStatements: true }],
+});
+const unsafePools = new PoolManager(unsafeConfig.datasources, silentLogger);
+after(() => {
+    pools.drainAll();
+    unsafePools.drainAll();
+});
 
 function svc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit(), ceiling = config.maxRowsCeiling) {
     return { qs: new QueryService(stub, pools, ceiling, audit), audit };
+}
+
+/** QueryService whose datasource has allowUnsafeStatements:true (guard skipped). */
+function unsafeSvc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit()) {
+    return { qs: new QueryService(stub, unsafePools, config.maxRowsCeiling, audit), audit };
 }
 
 const base = { tokenId: 't', datasource: 'main', schema: 'public' as string };
@@ -39,9 +55,11 @@ test('search_path names pg_temp last so temp tables cannot shadow the tenant sch
 
 test('scrubs session state with DISCARD ALL after COMMIT, outside the txn', async () => {
     const stub = new StubDriver();
-    const { qs } = svc(stub);
-    // A caller's plain SET survives COMMIT on a pooled connection; DISCARD ALL is
-    // what stops the next borrower inheriting it.
+    // A plain SET is now blocked by the statement guard on a normal datasource, so
+    // the scenario it protects (a caller's SET surviving COMMIT) only reaches the DB
+    // on an escape-hatch datasource — run it there; DISCARD ALL is what stops the
+    // next borrower inheriting it.
+    const { qs } = unsafeSvc(stub);
     await qs.run({ ...base, sql: 'SET statement_timeout = 0', write: false });
     const sqls = stub.sqls();
     assert.ok(sqls.indexOf('DISCARD ALL') > sqls.indexOf('COMMIT'));
@@ -170,7 +188,7 @@ test('does not truncate when rows <= maxRows', async () => {
     const stub = new StubDriver();
     stub.userResult = { fields: [], rows: [{ a: 1 }, { a: 2 }], rowCount: 2, command: 'SELECT' };
     const { qs } = svc(stub);
-    const { response } = await qs.run({ ...base, sql: 'x', write: false, maxRows: 5 });
+    const { response } = await qs.run({ ...base, sql: 'SELECT a', write: false, maxRows: 5 });
     assert.equal(response.truncated, false);
     assert.equal(response.rows.length, 2);
 });
@@ -179,7 +197,7 @@ test('clamps maxRows to the server ceiling', async () => {
     const stub = new StubDriver();
     stub.userResult = { fields: [], rows: Array.from({ length: 4 }, () => ({})), rowCount: 4, command: 'SELECT' };
     const { qs } = svc(stub, new CapturingAudit(), 3); // ceiling 3
-    const { response } = await qs.run({ ...base, sql: 'x', write: false, maxRows: 1000 });
+    const { response } = await qs.run({ ...base, sql: 'SELECT n', write: false, maxRows: 1000 });
     assert.equal(response.rows.length, 3);
     assert.equal(response.truncated, true);
 });
@@ -214,4 +232,48 @@ test('audits base fields and omits write fields on read path', async () => {
     assert.equal(typeof e.elapsedMs, 'number');
     assert.equal(e.write, undefined);
     assert.equal(e.command, undefined);
+});
+
+// ── statement guard (Phase 02/03) ──────────────────────────────────────────────
+
+test('guarded datasource: a banned payload is rejected before any DB contact', async () => {
+    const stub = new StubDriver();
+    const { qs } = svc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: "COPY (SELECT 1) TO PROGRAM 'id'", write: false }),
+        (e) => e instanceof BadRequestError,
+    );
+    assert.equal(stub.connectCount, 0); // never acquired a connection
+});
+
+test('guarded datasource: a blocked attempt is audited (security stream must see it)', async () => {
+    const stub = new StubDriver();
+    const { qs, audit } = svc(stub);
+    await assert.rejects(() => qs.run({ ...base, sql: "SELECT pg_read_file('/etc/passwd')", write: false }));
+    assert.equal(audit.entries.length, 1);
+    assert.equal(audit.entries[0].sql, "SELECT pg_read_file('/etc/passwd')");
+    assert.match(audit.entries[0].error ?? '', /not permitted/);
+});
+
+test('relaxed datasource (allowUnsafeStatements): the same payload reaches the driver', async () => {
+    const stub = new StubDriver();
+    const { qs } = unsafeSvc(stub);
+    await qs.run({ ...base, sql: "COPY (SELECT 1) TO PROGRAM 'id'", write: false });
+    assert.equal(stub.connectCount, 1); // guard skipped → connection acquired
+    assert.ok(stub.userStatements().some((s) => s.sql.startsWith('COPY')));
+    // Wrap order still holds around the caller SQL even on the relaxed path.
+    const sqls = stub.sqls();
+    assert.equal(sqls[0], 'BEGIN TRANSACTION READ ONLY');
+    assert.ok(sqls.indexOf('COMMIT') > sqls.indexOf("COPY (SELECT 1) TO PROGRAM 'id'"));
+    assert.equal(sqls[sqls.length - 1], 'DISCARD ALL');
+});
+
+test('multi-statement is rejected even on a relaxed datasource (escape hatch never relaxes that)', async () => {
+    const stub = new StubDriver();
+    const { qs } = unsafeSvc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'SELECT 1; DROP TABLE t', write: false }),
+        (e) => e instanceof BadRequestError,
+    );
+    assert.equal(stub.connectCount, 0);
 });
