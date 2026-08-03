@@ -25,12 +25,21 @@ export const datasourceSchema = z.object({
     idleTimeoutMs: z.coerce.number().int().nonnegative().default(10000),
     connectionTimeoutMs: z.coerce.number().int().nonnegative().default(5000),
     maxUses: z.coerce.number().int().nonnegative().default(7500),
-    // Escape hatch: when true, the per-statement guard (statement-guard.ts) is
-    // skipped for this datasource — dangerous/admin statements (COPY, pg_read_file,
-    // …) are permitted. Default false = guard enforced. The multi-statement scan
-    // and the read-only transaction stay on regardless. Enabling it re-exposes the
+    // Escape hatch: when true, the per-statement guard (statement-guard.ts) AND the
+    // relation guard (relation-guard.ts) are skipped for this datasource — dangerous/
+    // admin statements (COPY, pg_read_file, …) and catalog/denied-table reads are
+    // permitted. Default false = guards enforced. The multi-statement scan and the
+    // read-only transaction stay on regardless. Enabling it re-exposes the
     // RCE/file-access class IFF the DB role is privileged, so boot logs a WARN.
     allowUnsafeStatements: z.boolean().default(false),
+    // Per-datasource sensitive-relation denylist enforced by the relation guard
+    // (relation-guard.ts). Entries are `table` (matches in ANY schema) or `schema.table`
+    // (exact). Code default is EMPTY on purpose: the gateway stays generic, and
+    // deployments declare their own list in .env. Skipped by allowUnsafeStatements,
+    // like the statement guard.
+    deniedTables: z
+        .array(z.string().min(1).regex(/^[^.]+(\.[^.]+)?$/, 'expected "table" or "schema.table"'))
+        .default([]),
 });
 
 export const tokenSchema = z.object({

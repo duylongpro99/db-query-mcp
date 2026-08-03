@@ -110,3 +110,33 @@ test('throws when a token references an unknown datasource', () => {
     process.env.TOKEN_T_SCHEMAS = '*';
     assert.throws(() => loadConfig(), /unknown datasource "ghost"/);
 });
+
+/** Minimal valid single-datasource env; the caller sets DS_MAIN_DENIED_TABLES. */
+function minimalEnv(): void {
+    reset();
+    process.env.DATASOURCES = 'main';
+    process.env.DS_MAIN_HOST = 'h';
+    process.env.DS_MAIN_USER = 'u';
+    process.env.DS_MAIN_DATABASE = 'd';
+    process.env.TOKENS = 't';
+    process.env.TOKEN_T_SECRET = 's';
+    process.env.TOKEN_T_DATASOURCES = 'main';
+    process.env.TOKEN_T_SCHEMAS = '*';
+}
+
+test('DENIED_TABLES parses a comma list (trimmed) into deniedTables', () => {
+    minimalEnv();
+    process.env.DS_MAIN_DENIED_TABLES = 'user, public.role';
+    assert.deepEqual(loadConfig().datasources[0].deniedTables, ['user', 'public.role']);
+});
+
+test('DENIED_TABLES unset → empty deniedTables (code default is generic)', () => {
+    minimalEnv();
+    assert.deepEqual(loadConfig().datasources[0].deniedTables, []);
+});
+
+test('DENIED_TABLES with a malformed entry (a.b.c) fails boot fast', () => {
+    minimalEnv();
+    process.env.DS_MAIN_DENIED_TABLES = 'user, a.b.c';
+    assert.throws(() => loadConfig(), /table.*or.*schema\.table|Invalid pg-connection-pool config/);
+});

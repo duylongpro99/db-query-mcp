@@ -21,9 +21,16 @@
  */
 import type { Services } from '../services.js';
 import type { TokenConfig } from '../config/config.schema.js';
+import type { InternalTrust } from '../query/query-service.js';
+import { extractSqlRefs } from '../query/relation-guard.js';
 
 /** Audit identity for the probe — not a real token; filterable in the audit stream. */
 const BOOT_TOKEN_ID = 'boot:posture';
+
+/** PROBE_SQL reads pg_roles/pg_class/pg_namespace (unqualified pg_%). Without this the
+ *  relation guard would reject it and EVERY boot would report posture UNVERIFIED, i.e.
+ *  the security check would silently die. This is the gateway's own fixed catalog SQL. */
+const INTERNAL: InternalTrust = { internalCatalogQuery: true, reason: 'boot-probe' };
 
 /** Bound the catalog scan; a slow boot probe must not stall the transport. */
 const PROBE_TIMEOUT_MS = 5000;
@@ -118,14 +125,17 @@ function writeTokensFor(tokens: TokenConfig[], datasource: string): string[] {
 }
 
 async function probe(services: Services, datasource: string): Promise<Posture> {
-    const { response } = await services.queryService.run({
-        tokenId: BOOT_TOKEN_ID,
-        datasource,
-        schema: services.pools.getConfig(datasource).defaultSchema,
-        sql: PROBE_SQL,
-        write: false,
-        timeoutMs: PROBE_TIMEOUT_MS,
-    });
+    const { response } = await services.queryService.run(
+        {
+            tokenId: BOOT_TOKEN_ID,
+            datasource,
+            schema: services.pools.getConfig(datasource).defaultSchema,
+            sql: PROBE_SQL,
+            write: false,
+            timeoutMs: PROBE_TIMEOUT_MS,
+        },
+        INTERNAL,
+    );
 
     // Fail closed: an unexpected shape must NOT collapse into "nothing writable → OK".
     const row = response.rows[0];
@@ -152,16 +162,37 @@ async function probe(services: Services, datasource: string): Promise<Posture> {
 export async function assertReadOnlyPosture(services: Services, identity?: string): Promise<void> {
     const log = services.logger;
 
+    // Load the WASM parser once at boot so the first user query doesn't pay for it and
+    // a broken install is loud here rather than as a 400 on someone's query.
+    try {
+        await extractSqlRefs('SELECT 1');
+    } catch (err) {
+        log.error(
+            { err: err instanceof Error ? err.message : String(err) },
+            'SQL parser failed to initialise — every guarded query will be rejected (relation guard fails closed)',
+        );
+    }
+
     for (const datasource of services.pools.names()) {
-        // Loud when the statement guard has been switched off: this re-exposes the
-        // COPY/file/signal class IFF the DB role is privileged, so it cross-references
-        // the posture verdict below rather than standing alone.
-        if (services.pools.getConfig(datasource).allowUnsafeStatements) {
+        const dsCfg = services.pools.getConfig(datasource);
+
+        // Loud when the guards have been switched off: this re-exposes the
+        // COPY/file/signal class AND catalog/denied-table reads IFF the DB role is
+        // privileged, so it cross-references the posture verdict below rather than
+        // standing alone.
+        if (dsCfg.allowUnsafeStatements) {
             log.warn(
                 { datasource, allowUnsafeStatements: true },
                 `statement guard DISABLED for datasource "${datasource}" (ALLOW_UNSAFE_STATEMENTS=true) — ` +
-                    'dangerous statements (COPY, pg_read_file, backend signals, …) are permitted; ' +
+                    'dangerous statements (COPY, pg_read_file, backend signals, …) are permitted AND the ' +
+                    'relation guard is also DISABLED (catalog/metadata reads and denied tables are permitted); ' +
                     'ensure this datasource points at a trusted DB role',
+            );
+        } else {
+            log.info(
+                { datasource, deniedTables: dsCfg.deniedTables.length, catalogBlock: true },
+                `relation guard ENFORCED for datasource "${datasource}" — catalog/information_schema blocked in ` +
+                    `run_query, ${dsCfg.deniedTables.length} denied table pattern(s)`,
             );
         }
 

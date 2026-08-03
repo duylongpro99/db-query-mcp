@@ -20,6 +20,7 @@
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
         "fastify": "^5.2.0",
+        "libpg-query": "^18.1.4",
         "pg": "^8.13.0",
         "pino": "^9.5.0",
         "zod": "3.25.76"

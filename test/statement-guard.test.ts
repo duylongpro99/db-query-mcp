@@ -31,9 +31,15 @@ test('allows read-mode statements', () => {
     ok('WITH t AS (SELECT 1) SELECT * FROM t');
     ok('EXPLAIN SELECT 1');
     ok('EXPLAIN (FORMAT JSON) SELECT 1');
-    ok('SHOW server_version');
     ok('VALUES (1)');
     ok('TABLE pg_class');
+});
+
+// SHOW was removed from the read allowlist: it leaks server settings and exposes no
+// relations for the relation guard to police. Read a setting with current_setting().
+test('rejects SHOW (removed from the allowlist)', () => {
+    rejected('SHOW server_version');
+    rejected('SHOW all');
 });
 
 test('allows the boot-probe SQL and all introspection SQL', () => {

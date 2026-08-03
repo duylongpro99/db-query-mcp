@@ -77,6 +77,55 @@ test('POST /query — datasource outside caps → 403', async () => {
     assert.equal(res.statusCode, 403);
 });
 
+// ── relation guard over HTTP ────────────────────────────────────────────────────
+
+test('POST /query — catalog read (information_schema) → 400', async () => {
+    const res = await app.inject({
+        method: 'POST',
+        url: '/query',
+        headers: RO,
+        payload: { datasource: 'main', sql: 'SELECT * FROM information_schema.tables' },
+    });
+    assert.equal(res.statusCode, 400);
+    assert.match(res.json().error, /not readable through run_query/);
+});
+
+test('POST /query — SHOW is no longer allowed → 400', async () => {
+    const res = await app.inject({ method: 'POST', url: '/query', headers: RO, payload: { datasource: 'main', sql: 'SHOW all' } });
+    assert.equal(res.statusCode, 400);
+});
+
+test('POST /query — schema-restricted token reading another schema → 403', async () => {
+    // RW is scoped to schemas:['public']; a qualified cross-schema ref is a caps violation.
+    const res = await app.inject({
+        method: 'POST',
+        url: '/query',
+        headers: RW,
+        payload: { datasource: 'main', sql: 'SELECT * FROM "tenant_b".t' },
+    });
+    assert.equal(res.statusCode, 403);
+});
+
+// The single most important test in the plan: a caller must not be able to BUY the
+// introspection bypass by naming the internal trust flag in the request body. The zod
+// schema strips unknown keys, and the flag is a second positional arg to run() — it
+// can never be carried by a JSON body.
+test('POST /query — naming the internal trust flag in the body does NOT bypass the guard', async () => {
+    const res = await app.inject({
+        method: 'POST',
+        url: '/query',
+        headers: RO,
+        payload: {
+            datasource: 'main',
+            sql: 'SELECT * FROM pg_tables',
+            internalCatalogQuery: true,
+            internal: { internalCatalogQuery: true, reason: 'introspection' },
+        },
+    });
+    assert.equal(res.statusCode, 400);
+    assert.match(res.json().error, /not readable through run_query/);
+});
+
 test('GET /health — ok shape when pools answer', async () => {
     stub.pingError = null;
     const res = await app.inject({ method: 'GET', url: '/health' });

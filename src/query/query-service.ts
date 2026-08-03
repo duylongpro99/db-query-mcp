@@ -26,6 +26,7 @@ import type { AuditLogger } from '../audit/audit-logger.js';
 import type { QueryResponse } from './query.schema.js';
 import { assertSingleStatement } from './single-statement.js';
 import { assertStatementAllowed } from './statement-guard.js';
+import { assertRelationsAllowed } from './relation-guard.js';
 import { BadRequestError, ServiceUnavailableError } from './gateway-errors.js';
 
 /** idle_in_transaction_session_timeout is kept above statement_timeout so a
@@ -43,11 +44,26 @@ export interface RunInput {
     write: boolean;
     maxRows?: number;
     timeoutMs?: number;
+    /** Token schema capabilities (caps.schemas); ['*'] = any non-system schema.
+     *  Omitted ⇒ only `schema` itself is allowed (fail-closed). */
+    allowedSchemas?: string[];
 }
 
 export interface RunResult {
     response: QueryResponse;
     command: string; // pg command tag
+}
+
+/**
+ * Internal trust marker for the gateway's OWN fixed catalog SQL (introspection, boot
+ * posture probe). Deliberately a SECOND POSITIONAL ARGUMENT, never a RunInput field:
+ * an HTTP body or MCP args object can be spread into RunInput, but it can never become
+ * argument #2. Only in-process callers holding a QueryService can set it — unreachable
+ * by construction, not by convention. Never widen it to carry caller-supplied SQL.
+ */
+export interface InternalTrust {
+    internalCatalogQuery: true;
+    reason: 'introspection' | 'boot-probe';
 }
 
 function clamp(v: number, min: number, max: number): number {
@@ -70,7 +86,7 @@ export class QueryService {
         private readonly audit: AuditLogger,
     ) {}
 
-    async run(input: RunInput): Promise<RunResult> {
+    async run(input: RunInput, internal?: InternalTrust): Promise<RunResult> {
         const started = Date.now();
 
         // Guardrail (always-on, first): reject multi-statement SQL before any DB
@@ -96,6 +112,24 @@ export class QueryService {
             } catch (err) {
                 this.auditError(input, started, (err as Error).message);
                 throw err;
+            }
+        }
+
+        // Relation guard (third layer, still pre-DB-contact): parse the statement with
+        // the real Postgres parser and enforce catalog block + schema caps + denied
+        // tables on every referenced relation. Skipped for the gateway's OWN fixed
+        // catalog SQL (introspection / boot probe) and for a datasource the operator
+        // has explicitly opted out. Rejections (400 or 403) are audited like any other.
+        if (!dsCfg.allowUnsafeStatements && !internal?.internalCatalogQuery) {
+            try {
+                await assertRelationsAllowed(input.sql, {
+                    schema: input.schema,
+                    allowedSchemas: input.allowedSchemas ?? [input.schema],
+                    deniedTables: dsCfg.deniedTables,
+                });
+            } catch (err) {
+                this.auditError(input, started, (err as Error).message);
+                throw err; // BadRequestError 400 | ForbiddenError 403
             }
         }
 

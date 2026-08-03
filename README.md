@@ -33,8 +33,9 @@ pool and exposes a guarded QUERY capability instead of a connection.
 - **Read-only by default**, enforced at the engine (`BEGIN TRANSACTION READ ONLY`) with a
   DB-role backstop; an app-layer **statement guard** (leading-keyword allowlist + banned
   side-effecting-function scan) adds defense-in-depth for what a read-only txn does *not*
-  stop (`COPY`, `pg_read_file`, …) — belt to the braces, never the sole barrier. Writes
-  are opt-in (see below).
+  stop (`COPY`, `pg_read_file`, …), and a **relation guard** (real-parser tree walk) bounds
+  *what/where* a query may read (catalog block + schema caps + denied tables) — belt to the
+  braces, never the sole barrier. Writes are opt-in (see below).
 - **Layered timeouts**: `connectionTimeoutMillis` (acquire), `statement_timeout` (query),
   `idle_in_transaction_session_timeout` (stalled txn).
 - `acquire → use → release-in-finally`; a mandatory `pool.on('error')` handler on every
@@ -65,6 +66,11 @@ TOKEN_SVC_RW_SECRET=...     TOKEN_SVC_RW_DATASOURCES=main    TOKEN_SVC_RW_MODE=w
   `STATEMENT_TIMEOUT_MS`.
 - **Binding:** `HOST` defaults to `127.0.0.1`. Only loopback binds without
   `ALLOW_PUBLIC_BIND=true` — see [Network binding](#network-binding).
+- **Denied tables:** `DS_<NAME>_DENIED_TABLES` is a comma list of relations the
+  [relation guard](#relation-guard-schema-boundary--metadata-block--denylist) rejects
+  (400) before DB contact. Entries are `table` (matches in ANY schema) or `schema.table`
+  (exact); case-insensitive. **Code default is EMPTY** — the gateway is generic, so a
+  deployment must declare its own list in `.env` (see `.env.example`); boot logs the count.
 - **DB role:** point each datasource at a **read-only Postgres role**; that, not the
   token mode, is the real write barrier. See [The read-only guarantee](#the-read-only-guarantee-lives-in-the-database).
 
@@ -283,10 +289,13 @@ therefore passes an app-layer guard at the single `QueryService.run()` choke poi
 HTTP `/query`, MCP `run_query`, and introspection are all covered), **before any DB
 contact**:
 
-- **Leading-keyword allowlist.** Read mode permits `SELECT`, `WITH`, `EXPLAIN`, `SHOW`,
+- **Leading-keyword allowlist.** Read mode permits `SELECT`, `WITH`, `EXPLAIN`,
   `VALUES`, `TABLE`; write mode adds `INSERT`, `UPDATE`, `DELETE`, `MERGE`. Anything else
   (`COPY`, `CALL`, `DO`, `SET`, `ALTER`, `CREATE`, …) is rejected — an allowlist needs no
-  per-keyword maintenance.
+  per-keyword maintenance. **`SHOW` was removed** — it leaks server settings (`SHOW all` →
+  `data_directory`, `config_file`, connection strings) and exposes no relation for the
+  relation guard to police; read a specific setting with `current_setting('name')` or
+  `SELECT version()` instead.
 - **Banned-function scan.** Side-effecting/host-access functions (`pg_read_file`,
   `pg_ls_*`, `lo_export`, `dblink*`, `pg_reload_conf`, `pg_terminate_backend`,
   `pg_logical_emit_message`, `pg_stat_reset*`, …) are rejected in **both** modes, even
@@ -301,9 +310,11 @@ rejection is a `400` and is **audited** (blocked attempts, including `;`-smuggle
 in the security stream). The multi-statement scan and the read-only transaction are
 separate and always-on.
 
-The one residual evasion a text scanner can't close is a `U&"\0070g_read_file"`
-unicode-escape identifier — which is exactly why this is defense-in-depth and the
-non-superuser DB role (above) is the durable fix, not this guard.
+The `U&"\0070g_read_file"` unicode-escape identifier a text scanner cannot decode is now
+closed by the **relation guard** below, which runs the same banned-function list against
+the real parser's decoded names. Both scans share one list
+([`banned-functions.ts`](src/query/banned-functions.ts)) so they cannot drift; this text
+scan stays as belt-and-braces for SQL the parser accepts but shapes differently.
 
 This is **defense-in-depth, not the guarantee** — it ships *with* the non-superuser DB
 role above, never instead of it (denylists drift; the role holds no privilege to begin
@@ -311,10 +322,54 @@ with).
 
 **Escape hatch.** A datasource whose DB role is trusted and which legitimately needs
 admin/`COPY`/file statements can opt out with `DS_<NAME>_ALLOW_UNSAFE_STATEMENTS=true`
-(default **false**, fail-closed — any non-`true` value keeps the guard on). It relaxes
-**only** this statement guard; the multi-statement scan and the read-only transaction stay
-enforced. Enabling it removes a security layer, so **every boot logs a WARN** naming the
-datasource.
+(default **false**, fail-closed — any non-`true` value keeps the guard on). It relaxes the
+statement guard **and** the relation guard below; the multi-statement scan and the
+read-only transaction stay enforced. Enabling it removes two security layers, so **every
+boot logs a WARN** naming the datasource.
+
+### Relation guard (schema boundary + metadata block + denylist)
+
+The statement guard answers *whether* a statement may run; it says nothing about *what* it
+reads. Read-only is a write control, and the DB role is `pg_read_all_data` — SELECT on
+every relation, forever — so on its own the gateway would expose `information_schema`, the
+`pg_catalog` views (`pg_tables`, `pg_roles`, `pg_settings`, …), and every identity/secrets
+table to any read token. Postgres cannot fix this at the grant layer: `pg_catalog` access
+cannot be revoked, and grants are additive so tables cannot be carved out of
+`pg_read_all_data`. So the boundary is enforced at the app layer, at the same
+`QueryService.run()` choke point, **before any DB contact**:
+
+- **Parse, don't pattern-match.** Every statement is parsed with the *real* Postgres parser
+  ([`libpg-query`](src/query/relation-guard.ts)); the guard walks the parse tree for the
+  relations it references (CTE-aware — a `WITH` name is not a table) and the functions it
+  calls. This includes **write/create targets** on the write path — the `INSERT`/`UPDATE`/
+  `DELETE`/`MERGE` target and `SELECT … INTO` — so a write-mode token is confined to its
+  caps and the denylist just as reads are (a target named like an enclosing CTE is still the
+  real table). Decoded identifiers close the `U&"\0070g_read_file"` / `U&"\0075ser"`
+  unicode-escape gap a lexer cannot. **Unparseable SQL is rejected (400)** — SQL the gateway
+  cannot understand is SQL it cannot police (fail-closed).
+- **Four relation rules:** a relation qualified with a **system schema** (`pg_catalog`,
+  `pg_toast`, `pg_temp*`, `information_schema`) → **400**; qualified with **another schema
+  outside the token's `SCHEMAS` caps** → **403**; an **unqualified `pg_%`** name (which
+  resolves to `pg_catalog`, implicitly first on `search_path`) → **400**; the effective
+  schema + relation on the datasource's **`DS_<NAME>_DENIED_TABLES`** list → **400**.
+- **Metadata path.** `list_schemas` / `list_tables` / `describe_table` are the sanctioned,
+  caps-filtered way to see structure. They run fixed, parameterized `information_schema`
+  reads on an **internal trusted route** that a caller cannot request — the trust flag is a
+  second positional argument to `run()`, never a request field, so no HTTP body or MCP args
+  object can set it. (The boot posture probe uses the same internal route.)
+- **Escape hatch.** `DS_<NAME>_ALLOW_UNSAFE_STATEMENTS=true` skips the statement guard **and**
+  this relation guard; boot WARNs. Every boot also logs the guard state and denied-table
+  count per datasource.
+
+Rejections (both 400 and 403) are **audited** — a qualified cross-schema 403 is the
+tenant-probe signal worth alerting on.
+
+**Residual risks (accepted).** A **view** in an allowed schema over a denied table still
+reads it (views run with owner privileges; no such views are known — the DB-grants runbook
+is the durable fix). Scalar metadata functions (`version()`, `current_setting()`,
+`current_user`) stay readable — not table data. And this is app-layer enforcement over a
+shared `pg_read_all_data` role: it holds only as long as the guard does. The belt exists;
+explicit per-token grants ([runbook](docs/runbooks/agent-ro-pg-role.md)) are the braces.
 
 ### Network binding
 
@@ -347,18 +402,25 @@ logged. Rotation is therefore the only exposure control:
 4. Rotate the **DB** password separately (`ALTER ROLE … PASSWORD …`, a user action) and
    update `DS_<NAME>_PASSWORD`; the bearer and the DB credential are independent secrets.
 
-### ⚠️ Trust boundary — schema caps are NOT a hard tenant boundary
+### ⚠️ Trust boundary — schema caps, and how far they now reach
 
-A token's `SCHEMAS` capability gates the **declared** target schema (the `schema` field /
-`search_path`), **not** what the SQL body may touch. Every query runs as one shared DB
-role, so **fully-qualified references bypass `search_path`** — e.g. a token scoped to
-`public` can still run `SELECT * FROM "other_tenant".t`. `SET LOCAL search_path` guarantees
-tenant isolation *between pooled borrowers* (the P0 invariant), but it does **not** confine
-a caller that writes qualified names. Treat `SCHEMAS` as an accident-guard for trusted
-callers, **not** a multi-tenant security boundary. If you need hard per-token schema
-confinement, enforce it in Postgres (a DB role per token with `USAGE`/privileges revoked on
-other schemas) — which is incompatible with the current shared-pool topology and is a
-deliberate out-of-scope tradeoff for this utility.
+Since the relation guard, a token's `SCHEMAS` capability **is** enforced against the
+relations a query actually references — not just the declared `schema` / `search_path`. A
+token scoped to `public` now gets a **403** on `SELECT * FROM "other_tenant".t`, because the
+guard parses the statement and checks every qualified relation against the caps (the same
+`capabilityAllows` used for the declared schema). `SET LOCAL search_path` still guarantees
+tenant isolation *between pooled borrowers* (the P0 invariant); the guard adds confinement
+of the SQL body on top of it.
+
+Two limits remain, so this is a strong app-layer boundary, **not** a database-enforced one:
+
+- It holds only as long as the guard does — every query still runs as one shared
+  `pg_read_all_data` role, and a **view** in an allowed schema can read across into a schema
+  the token could not name directly.
+- For a *hard* per-token boundary, enforce it in Postgres: a DB role per token with `USAGE`
+  revoked on other schemas, or explicit per-schema grants
+  ([`docs/runbooks/agent-ro-pg-role.md`](docs/runbooks/agent-ro-pg-role.md)). That is a
+  deliberate follow-up, incompatible with the current single shared-pool topology.
 
 ### TLS note
 
