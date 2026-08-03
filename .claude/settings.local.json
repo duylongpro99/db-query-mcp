@@ -1,0 +1,6 @@
+{
+  "enabledMcpjsonServers": [
+    "pg-connection-pool"
+  ],
+  "enableAllProjectMcpServers": true
+}
