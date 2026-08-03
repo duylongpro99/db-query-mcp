@@ -11,6 +11,14 @@ export class BadRequestError extends Error {
     }
 }
 
+export class ForbiddenError extends Error {
+    readonly status = 403;
+    constructor(message: string) {
+        super(message);
+        this.name = 'ForbiddenError';
+    }
+}
+
 export class ServiceUnavailableError extends Error {
     readonly status = 503;
     constructor(message: string) {

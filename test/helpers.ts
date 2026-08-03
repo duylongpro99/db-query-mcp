@@ -33,6 +33,7 @@ export function makeConfig(overrides: Partial<RootConfig> = {}): RootConfig {
                 connectionTimeoutMs: 5000,
                 maxUses: 7500,
                 allowUnsafeStatements: false,
+                deniedTables: [],
             },
         ],
         tokens: [

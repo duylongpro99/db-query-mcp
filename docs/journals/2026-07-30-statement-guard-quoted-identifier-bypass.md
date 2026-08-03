@@ -21,7 +21,7 @@ We shipped a security layer with opposite design requirements in a shared data s
   - Function scan runs over this view; keyword + single-statement scans stay fully blanked
   - Bypass reproduced at guard layer, then confirmed closed
   - No false positives; 136 tests pass, 0 fail
-- **Residual risk**: Unicode-escape identifiers (U&"\0070...") still evade text lexer — documented as unfixable by lexer alone
+- **Residual risk**: Unicode-escape identifiers (U&"\0070...") still evade text lexer — documented as unfixable by lexer alone. **Closed 2026-08-03** by the relation guard (`src/query/relation-guard.ts`), which runs the SAME banned-function list against `libpg-query`'s DECODED parse-tree names — `U&"\0070g_read_file"` arrives as `pg_read_file` and is rejected. The text scan stays as belt-and-braces; both share one list (`banned-functions.ts`) so they cannot drift. See plan `plans/20260803-1313-run-query-relation-guard-hardening/`.
 
 ## Root Cause Analysis
 

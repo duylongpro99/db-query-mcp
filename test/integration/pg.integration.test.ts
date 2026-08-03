@@ -18,7 +18,7 @@ import { PostgresDriver } from '../../src/driver/postgres-driver.js';
 import { QueryService } from '../../src/query/query-service.js';
 import { IntrospectService } from '../../src/introspect/introspect-service.js';
 import type { DatasourceConfig } from '../../src/config/config.schema.js';
-import { ServiceUnavailableError } from '../../src/query/gateway-errors.js';
+import { BadRequestError, ServiceUnavailableError } from '../../src/query/gateway-errors.js';
 import { silentLogger, CapturingAudit } from '../helpers.js';
 
 const HOST = process.env.PGCP_TEST_HOST ?? process.env.DATABASE_HOST;
@@ -56,6 +56,11 @@ let pools: PoolManager;
 let qs: QueryService;
 let introspect: IntrospectService;
 
+// A second stack with the relation guard ENFORCED (allowUnsafeStatements:false) and a
+// denied-table list, so we can prove the wired guard against real Postgres.
+let guardedPools: PoolManager;
+let guardedQs: QueryService;
+
 before(async () => {
     if (!RUN) return;
     // Test fixtures via a DIRECT client (DDL is not part of the gateway's surface).
@@ -77,6 +82,9 @@ before(async () => {
     const driver = new PostgresDriver(pools);
     qs = new QueryService(driver, pools, 10000, new CapturingAudit());
     introspect = new IntrospectService(qs, pools);
+
+    guardedPools = new PoolManager([{ ...dsConfig(1), allowUnsafeStatements: false, deniedTables: ['secret'] }], silentLogger);
+    guardedQs = new QueryService(new PostgresDriver(guardedPools), guardedPools, 10000, new CapturingAudit());
 });
 
 after(async () => {
@@ -87,6 +95,7 @@ after(async () => {
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA_B} CASCADE`);
     await admin.end();
     await pools.drainAll();
+    await guardedPools.drainAll();
 });
 
 test('P0: reused pooled connection targets the right tenant schema (no leak)', opts, async () => {
@@ -211,4 +220,26 @@ test('introspection returns real structure through the guarded path', opts, asyn
 test('pool ping succeeds and drain ends pools', opts, async () => {
     await pools.ping('main');
     // (drainAll is exercised in `after`; ping proves the pool is live)
+});
+
+// ── relation guard on a real server (guard ENFORCED datasource) ──────────────────
+
+test('SECURITY: the wired relation guard rejects a catalog read against real Postgres', opts, async () => {
+    await assert.rejects(
+        () => guardedQs.run({ tokenId: 't', datasource: 'main', schema: SCHEMA_A, sql: 'SELECT * FROM information_schema.tables', write: false, allowedSchemas: ['*'] }),
+        (e) => e instanceof BadRequestError,
+    );
+});
+
+test('SECURITY: the wired relation guard rejects a denied table before DB contact', opts, async () => {
+    // `secret` need not exist — the guard rejects pre-connect, purely from the parse tree.
+    await assert.rejects(
+        () => guardedQs.run({ tokenId: 't', datasource: 'main', schema: SCHEMA_A, sql: 'SELECT * FROM secret', write: false, allowedSchemas: ['*'] }),
+        (e) => e instanceof BadRequestError,
+    );
+});
+
+test('the guard permits an ordinary tenant read (real row returned)', opts, async () => {
+    const r = await guardedQs.run({ tokenId: 't', datasource: 'main', schema: SCHEMA_A, sql: 'SELECT id FROM t', write: false, allowedSchemas: ['*'] });
+    assert.deepEqual(r.response.rows, [{ id: 1 }]);
 });

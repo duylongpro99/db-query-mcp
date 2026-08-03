@@ -28,8 +28,10 @@ function sha256(s: string): Buffer {
     return createHash('sha256').update(s).digest();
 }
 
-/** '*' wildcard or explicit membership. */
-function allowed(list: string[], value: string): boolean {
+/** '*' wildcard or explicit membership — the ONE definition of a caps match, shared
+ *  by authorize() below and the relation guard's cross-schema check so the two
+ *  cannot drift. */
+export function capabilityAllows(list: string[], value: string): boolean {
     return list.includes('*') || list.includes(value);
 }
 
@@ -68,7 +70,7 @@ export class TokenAuth {
     }
 
     datasourceAllowed(caps: Capabilities, datasource: string): boolean {
-        return allowed(caps.datasources, datasource);
+        return capabilityAllows(caps.datasources, datasource);
     }
 
     /**
@@ -77,10 +79,10 @@ export class TokenAuth {
      * distinguish "forbidden" from "does not exist" (no enumeration leak).
      */
     authorize(caps: Capabilities, req: { datasource: string; schema: string; writeRequested: boolean }): AuthzResult {
-        if (!allowed(caps.datasources, req.datasource)) {
+        if (!capabilityAllows(caps.datasources, req.datasource)) {
             return { ok: false, status: 403, reason: `datasource "${req.datasource}" not permitted` };
         }
-        if (!allowed(caps.schemas, req.schema)) {
+        if (!capabilityAllows(caps.schemas, req.schema)) {
             return { ok: false, status: 403, reason: `schema "${req.schema}" not permitted` };
         }
         // Double gate: writing requires a write-capable token AND explicit readOnly:false.

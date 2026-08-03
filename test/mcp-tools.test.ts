@@ -87,3 +87,62 @@ test('list_tables delegates to IntrospectService', async () => {
     const res = await fake.tools.get('list_tables')!.handler({ datasource: 'main', schema: 'public' });
     assert.deepEqual(JSON.parse(res.content[0].text), { tables: [{ name: 't1', type: 'BASE TABLE' }] });
 });
+
+// ── relation guard over MCP ─────────────────────────────────────────────────────
+
+test('run_query: a catalog read is rejected (isError) before any DB contact', async () => {
+    const stub = new StubDriver();
+    const { services, fake } = setup(stub);
+    registerTools(fake as never, services, roCaps);
+    const res = await fake.tools.get('run_query')!.handler({ datasource: 'main', sql: 'SELECT * FROM pg_tables' });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /not readable through run_query/);
+    assert.equal(stub.connectCount, 0);
+});
+
+test('run_query: a schema-scoped token reading another schema → isError (caps violation)', async () => {
+    const stub = new StubDriver();
+    const { services, fake } = setup(stub);
+    registerTools(fake as never, services, rwCaps); // schemas:['public']
+    const res = await fake.tools.get('run_query')!.handler({ datasource: 'main', sql: 'SELECT * FROM "tenant_b".t' });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /"tenant_b" not permitted/);
+    assert.equal(stub.connectCount, 0);
+});
+
+// The MCP twin of the HTTP unreachability test: naming the internal trust flag in the
+// tool args must NOT bypass the guard (the handler never forwards it to run()).
+test('run_query: naming the internal trust flag in args does NOT bypass the guard', async () => {
+    const stub = new StubDriver();
+    const { services, fake } = setup(stub);
+    registerTools(fake as never, services, roCaps);
+    const res = await fake.tools.get('run_query')!.handler({ datasource: 'main', sql: 'SELECT * FROM pg_tables', internalCatalogQuery: true });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /not readable through run_query/);
+    assert.equal(stub.connectCount, 0);
+});
+
+test('introspection tools still return data via the internal trusted path', async () => {
+    const stub = new StubDriver();
+    const { services, fake } = setup(stub);
+    registerTools(fake as never, services, roCaps);
+
+    stub.userResult = { fields: [], rows: [{ schema_name: 'public' }], rowCount: 1, command: 'SELECT' };
+    const schemas = await fake.tools.get('list_schemas')!.handler({ datasource: 'main' });
+    assert.deepEqual(JSON.parse(schemas.content[0].text), { schemas: ['public'] });
+
+    stub.userResult = { fields: [], rows: [{ table_name: 't1', table_type: 'BASE TABLE' }], rowCount: 1, command: 'SELECT' };
+    const tables = await fake.tools.get('list_tables')!.handler({ datasource: 'main', schema: 'public' });
+    assert.deepEqual(JSON.parse(tables.content[0].text), { tables: [{ name: 't1', type: 'BASE TABLE' }] });
+
+    stub.userResult = {
+        fields: [],
+        rows: [{ column_name: 'id', data_type: 'uuid', is_nullable: 'NO', column_default: null, ordinal_position: 1 }],
+        rowCount: 1,
+        command: 'SELECT',
+    };
+    const cols = await fake.tools.get('describe_table')!.handler({ datasource: 'main', schema: 'public', table: 't1' });
+    assert.deepEqual(JSON.parse(cols.content[0].text), {
+        columns: [{ name: 'id', dataType: 'uuid', nullable: false, default: null, position: 1 }],
+    });
+});

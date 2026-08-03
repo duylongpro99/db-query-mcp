@@ -34,6 +34,7 @@ export function registerQueryRoute(app: FastifyInstance, s: Services): void {
                 write: writeRequested,
                 maxRows: body.maxRows,
                 timeoutMs: body.timeoutMs,
+                allowedSchemas: caps.schemas,
             });
             return reply.code(200).send(response);
         } catch (err) {

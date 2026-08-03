@@ -2,7 +2,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { PoolManager } from '../src/pool/pool-manager.js';
 import { QueryService } from '../src/query/query-service.js';
-import { BadRequestError, ServiceUnavailableError } from '../src/query/gateway-errors.js';
+import { BadRequestError, ForbiddenError, ServiceUnavailableError } from '../src/query/gateway-errors.js';
 import { makeConfig, silentLogger, StubDriver, CapturingAudit } from './helpers.js';
 
 const config = makeConfig();
@@ -15,9 +15,17 @@ const unsafeConfig = makeConfig({
     datasources: [{ ...config.datasources[0], allowUnsafeStatements: true }],
 });
 const unsafePools = new PoolManager(unsafeConfig.datasources, silentLogger);
+
+// A third pool whose 'main' datasource carries a denied-table list, so the relation
+// guard rejects those relations (same-name datasource keeps `base` unchanged).
+const deniedConfig = makeConfig({
+    datasources: [{ ...config.datasources[0], deniedTables: ['user', 'public.role'] }],
+});
+const deniedPools = new PoolManager(deniedConfig.datasources, silentLogger);
 after(() => {
     pools.drainAll();
     unsafePools.drainAll();
+    deniedPools.drainAll();
 });
 
 function svc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit(), ceiling = config.maxRowsCeiling) {
@@ -27,6 +35,11 @@ function svc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit(), cei
 /** QueryService whose datasource has allowUnsafeStatements:true (guard skipped). */
 function unsafeSvc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit()) {
     return { qs: new QueryService(stub, unsafePools, config.maxRowsCeiling, audit), audit };
+}
+
+/** QueryService whose datasource carries deniedTables (relation guard enforced). */
+function deniedSvc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit()) {
+    return { qs: new QueryService(stub, deniedPools, config.maxRowsCeiling, audit), audit };
 }
 
 const base = { tokenId: 't', datasource: 'main', schema: 'public' as string };
@@ -274,6 +287,105 @@ test('multi-statement is rejected even on a relaxed datasource (escape hatch nev
     await assert.rejects(
         () => qs.run({ ...base, sql: 'SELECT 1; DROP TABLE t', write: false }),
         (e) => e instanceof BadRequestError,
+    );
+    assert.equal(stub.connectCount, 0);
+});
+
+// ── relation guard (Phase 03 wiring) ────────────────────────────────────────────
+
+test('relation guard: a catalog read is rejected before any DB contact and is audited', async () => {
+    const stub = new StubDriver();
+    const { qs, audit } = svc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'SELECT * FROM information_schema.tables', write: false, allowedSchemas: ['*'] }),
+        (e) => e instanceof BadRequestError,
+    );
+    assert.equal(stub.connectCount, 0); // guard ran pre-connect
+    assert.equal(audit.entries.length, 1);
+    assert.match(audit.entries[0].error ?? '', /not readable through run_query/);
+});
+
+test('relation guard: a cross-schema ref outside caps surfaces ForbiddenError (403 via statusOf)', async () => {
+    const stub = new StubDriver();
+    const { qs } = svc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'SELECT * FROM "tenant_b".t', write: false, allowedSchemas: ['public'] }),
+        (e) => e instanceof ForbiddenError && (e as ForbiddenError).status === 403,
+    );
+    assert.equal(stub.connectCount, 0);
+});
+
+test('relation guard: unqualified schema defaults to declared schema only (fail-closed) → cross-schema 403', async () => {
+    // No allowedSchemas passed ⇒ defaults to [input.schema] = ['public'].
+    const stub = new StubDriver();
+    const { qs } = svc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'SELECT * FROM "tenant_b".t', write: false }),
+        (e) => e instanceof ForbiddenError,
+    );
+    assert.equal(stub.connectCount, 0);
+});
+
+test('relation guard: a denied table is rejected before any DB contact and is audited', async () => {
+    const stub = new StubDriver();
+    const { qs, audit } = deniedSvc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'SELECT * FROM "user"', write: false, allowedSchemas: ['*'] }),
+        (e) => e instanceof BadRequestError,
+    );
+    assert.equal(stub.connectCount, 0);
+    assert.equal(audit.entries.length, 1);
+    assert.match(audit.entries[0].error ?? '', /denied-table list/);
+});
+
+test('relation guard: an allowed tenant read reaches the driver unchanged', async () => {
+    const stub = new StubDriver();
+    const { qs } = svc(stub);
+    await qs.run({ ...base, sql: 'SELECT id FROM t', write: false, allowedSchemas: ['public'] });
+    assert.equal(stub.connectCount, 1);
+    assert.ok(stub.userStatements().some((s) => s.sql === 'SELECT id FROM t'));
+});
+
+test('relation guard: allowUnsafeStatements skips it — catalog + denied reads reach the driver', async () => {
+    for (const sql of ['SELECT * FROM pg_tables', 'SELECT * FROM "user"']) {
+        const stub = new StubDriver();
+        const { qs } = unsafeSvc(stub);
+        await qs.run({ ...base, sql, write: false, allowedSchemas: ['public'] });
+        assert.equal(stub.connectCount, 1, sql);
+        assert.ok(stub.userStatements().some((s) => s.sql === sql), sql);
+    }
+});
+
+test('relation guard: the internal trusted path bypasses the catalog block (introspection SQL)', async () => {
+    const stub = new StubDriver();
+    const { qs } = svc(stub);
+    await qs.run(
+        { ...base, sql: 'SELECT * FROM information_schema.tables', write: false, allowedSchemas: ['public'] },
+        { internalCatalogQuery: true, reason: 'introspection' },
+    );
+    assert.equal(stub.connectCount, 1); // reached the driver
+    assert.ok(stub.userStatements().some((s) => s.sql.includes('information_schema.tables')));
+});
+
+// WRITE PATH: the guard must police the write TARGET, not just read-side relations —
+// otherwise a write-mode token writes cross-tenant or to a denied table unpoliced.
+test('relation guard: a write to a DENIED target is rejected before any DB contact', async () => {
+    const stub = new StubDriver();
+    const { qs, audit } = deniedSvc(stub); // deniedTables includes 'user'
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'DELETE FROM "user" WHERE id = 1', write: true, allowedSchemas: ['*'] }),
+        (e) => e instanceof BadRequestError,
+    );
+    assert.equal(stub.connectCount, 0);
+    assert.match(audit.entries[0].error ?? '', /denied-table list/);
+});
+
+test('relation guard: a write to a cross-schema target outside caps → 403 before DB contact', async () => {
+    const stub = new StubDriver();
+    const { qs } = svc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'INSERT INTO "tenant_b".t VALUES (1)', write: true, allowedSchemas: ['public'] }),
+        (e) => e instanceof ForbiddenError && (e as ForbiddenError).status === 403,
     );
     assert.equal(stub.connectCount, 0);
 });

@@ -45,7 +45,9 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
                 'Execute ONE SQL statement against a logical datasource and return neutral ' +
                 '{columns,rows,rowCount,truncated,elapsedMs}. Read-only by default; set readOnly:false ' +
                 'only with a write-capable token. schema defaults to the datasource default — pass a ' +
-                'tenant/account-UUID schema to target a specific tenant. Use $1,$2… params, never inline values.',
+                'tenant/account-UUID schema to target a specific tenant. Use $1,$2… params, never inline values. ' +
+                'Catalog/information_schema relations and some sensitive tables are blocked — use ' +
+                'list_schemas/list_tables/describe_table for structure.',
             inputSchema: {
                 datasource: z.string().describe('Logical datasource name'),
                 schema: z.string().optional().describe('Target schema (tenant/account UUID); omit for datasource default'),
@@ -69,6 +71,7 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
                     write: writeRequested,
                     maxRows: args.maxRows,
                     timeoutMs: args.timeoutMs,
+                    allowedSchemas: caps.schemas,
                 });
                 return ok(response);
             } catch (e) {

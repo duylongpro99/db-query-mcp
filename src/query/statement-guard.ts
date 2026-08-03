@@ -21,54 +21,24 @@
  * function scan reads the ident-REVEALING view so a quoted call `"pg_read_file"(…)`
  * — which Postgres resolves to the same function — is still caught.
  *
- * Residual gap (by design): a `U&"\0070g_read_file"` unicode-ESCAPE identifier cannot
- * be decoded by a lexer, so it can evade the name match. This is precisely why the
- * guard is defense-in-depth — the non-superuser DB role, which simply holds no
- * privilege to run these, is the durable fix (see the runbook / risk report).
+ * The `U&"\0070g_read_file"` unicode-ESCAPE identifier that a lexer cannot decode is
+ * now caught by the relation guard (relation-guard.ts), which runs the SAME banned
+ * list against the real parser's DECODED names. This text scan stays as belt-and-
+ * braces for SQL the parser accepts but shapes differently; both share one list
+ * (banned-functions.ts) so they cannot drift. The non-superuser DB role, which holds
+ * no privilege to run these, remains the durable fix (see the runbook / risk report).
  */
 import { stripToCode } from './sql-lexer.js';
 import { BadRequestError } from './gateway-errors.js';
+import { BANNED_CALL_PATTERNS } from './banned-functions.js';
 
-/** Read mode: pure retrieval statements only. */
-const ALLOW_READ = ['SELECT', 'WITH', 'EXPLAIN', 'SHOW', 'VALUES', 'TABLE'] as const;
+/** Read mode: pure retrieval statements only. `SHOW` is intentionally NOT here — it
+ *  leaks server settings (`SHOW all` → data_directory, config_file, …) and exposes no
+ *  relations for the relation guard to police, so it was removed from the allowlist.
+ *  Read a specific setting with `current_setting('name')` or `SELECT version()`. */
+const ALLOW_READ = ['SELECT', 'WITH', 'EXPLAIN', 'VALUES', 'TABLE'] as const;
 /** Write mode: the read set plus the data-modifying statements. */
 const ALLOW_WRITE = [...ALLOW_READ, 'INSERT', 'UPDATE', 'DELETE', 'MERGE'] as const;
-
-/**
- * Side-effecting / host-access functions, banned in BOTH modes (dangerous
- * regardless of write intent). Each pattern is whole-identifier + optional space +
- * `(`. The leading `\b` also matches after a schema qualifier, so
- * `pg_catalog.pg_read_file(…)` is caught. Grouped + commented because this is a
- * denylist and denylists drift — keep it legible, and remember the DB role
- * (Phase 05) is the durable fix.
- */
-const BANNED_FUNCTIONS: RegExp[] = [
-    // File / dir access
-    /\b(pg_read_file)\s*\(/i,
-    /\b(pg_read_binary_file)\s*\(/i,
-    /\b(pg_stat_file)\s*\(/i,
-    /\b(pg_ls_\w+)\s*\(/i, // pg_ls_dir, pg_ls_waldir, pg_ls_logdir, pg_ls_tmpdir, …
-    // Large-object server files
-    /\b(lo_export)\s*\(/i,
-    /\b(lo_import)\s*\(/i,
-    // Cross-DB / RCE
-    /\b(dblink\w*)\s*\(/i, // dblink, dblink_exec, dblink_connect[_u]
-    // Config / signal / log
-    /\b(pg_reload_conf)\s*\(/i,
-    /\b(pg_terminate_backend)\s*\(/i,
-    /\b(pg_cancel_backend)\s*\(/i,
-    /\b(pg_rotate_logfile)\s*\(/i,
-    // WAL / CDC / replication
-    /\b(pg_logical_emit_message)\s*\(/i,
-    /\b(pg_create_logical_replication_slot)\s*\(/i,
-    /\b(pg_create_physical_replication_slot)\s*\(/i,
-    /\b(pg_drop_replication_slot)\s*\(/i,
-    /\b(pg_replication_slot_advance)\s*\(/i,
-    /\b(pg_logical_slot_get_changes)\s*\(/i,
-    /\b(pg_logical_slot_peek_changes)\s*\(/i,
-    // Observability tamper
-    /\b(pg_stat_reset\w*)\s*\(/i,
-];
 
 const HINT = 'If this datasource must run such statements, set DS_<NAME>_ALLOW_UNSAFE_STATEMENTS=true (and ensure its DB role is trusted).';
 
@@ -97,7 +67,7 @@ export function assertStatementAllowed(sql: string, opts: { write: boolean }): v
     // stay visible or the call slips through. Functions can hide inside an allowed
     // statement, so scan the whole body.
     const fnScanCode = stripToCode(sql, { revealQuotedIdents: true });
-    for (const re of BANNED_FUNCTIONS) {
+    for (const re of BANNED_CALL_PATTERNS) {
         const m = re.exec(fnScanCode);
         if (m) {
             throw new BadRequestError(`Function "${m[1]}" is not permitted by this gateway. ${HINT}`);

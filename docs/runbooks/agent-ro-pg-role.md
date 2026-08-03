@@ -6,7 +6,9 @@
 
 The gateway currently connects as a **superuser** (`mds_dev`). Under a superuser role, `BEGIN TRANSACTION READ ONLY` does **not** stop `COPY … TO PROGRAM/'file'`, `pg_read_file`/`pg_ls_dir`, `pg_reload_conf`, others' `pg_terminate_backend`, `pg_logical_emit_message`, `CREATE EXTENSION`, or untrusted-language `DO` — so a read-only token reached RCE + host file R/W + a persistent write.
 
-The [statement guard](../../src/query/statement-guard.ts) (shipped) blocks these at the app layer, but a **denylist is fragile** and is defense-in-depth only. The durable guarantee is a login role that simply **holds no privilege** to do any of it. Run the guard **and** the role — belt to the braces.
+The [statement guard](../../src/query/statement-guard.ts) and the [relation guard](../../src/query/relation-guard.ts) (both shipped) block these — and catalog/cross-schema/denied-table reads — at the app layer, but a **denylist is fragile** and is defense-in-depth only. The durable guarantee is a login role that simply **holds no privilege** to do any of it. Run the guards **and** the role — belt to the braces.
+
+Where the relation guard's app-layer denylist stops short and this role takes over: a **view** in an allowed schema over a denied table still reads it (views run with owner privileges), and the shared `pg_read_all_data` role can read every relation the guard is not parsing for. Per-schema/per-table grants under a dedicated role are the only *hard* boundary. The deferred "explicit grants (drop `pg_read_all_data`)" variant below is that braces — the guard is the belt.
 
 ## Runbook (run as a human DBA, as superuser/owner)
 
